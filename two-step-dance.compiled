@@ -1,0 +1,49 @@
+[
+  {
+    "type": "MATCH_ETHERTYPE",
+    "not": true,
+    "or": false,
+    "etherType": 2048
+  },
+  {
+    "type": "MATCH_ETHERTYPE",
+    "not": true,
+    "or": false,
+    "etherType": 2054
+  },
+  {
+    "type": "MATCH_ETHERTYPE",
+    "not": true,
+    "or": false,
+    "etherType": 34525
+  },
+  {
+    "type": "MATCH_CHARACTERISTICS",
+    "not": true,
+    "or": true,
+    "mask": "1000000000000000"
+  },
+  {
+    "type": "ACTION_DROP"
+  },
+  {
+    "type": "MATCH_TAGS_BITWISE_OR",
+    "not": true,
+    "or": false,
+    "id": 1000,
+    "value": 0
+  },
+  {
+    "type": "MATCH_TAGS_BITWISE_AND",
+    "not": false,
+    "or": false,
+    "id": 1001,
+    "value": 0
+  },
+  {
+    "type": "ACTION_BREAK"
+  },
+  {
+    "type": "ACTION_ACCEPT"
+  }
+]

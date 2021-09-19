@@ -1,0 +1,33 @@
+tag classified
+  id 1000
+  enum 0 no
+  enum 1 secret
+  enum 2 top
+  default no
+;
+
+tag clearance
+  id 1001
+  default 0
+  flag 1 security
+  flag 2 r_and_d
+  flag 4 customer_support
+  flag 8 sustaining
+  flag 16 storage
+;
+
+# Whitelist only IPv4 (/ARP) and IPv6 traffic and allow only ZeroTier-assigned IP addresses
+drop                      # drop cannot be overridden by capabilities
+  not ethertype ipv4      # frame is not ipv4
+  and not ethertype arp   # AND is not ARP
+  and not ethertype ipv6  # AND is not ipv6
+  or not chr ipauth       # OR IP addresses are not authenticated
+;
+
+break                     # reject if...
+  not tor classified 0    # one end is classified
+  and tand clearance 0    # no bit overlap in clearance
+;
+
+# Accept other packets
+accept;

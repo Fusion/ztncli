@@ -1,0 +1,454 @@
+#!/bin/bash
+
+export LC_ALL=C
+
+usage() {
+  cat << EOB
+
+Usage:
+
+    $0 [options] [action]
+
+Options:
+
+    -c | --config <path>
+        Specify path to an alternate configuration file.
+        The default configuration file, in the current directory, is $CONFIG.
+    -d | --details
+        When listing resources, display a light level of details.
+    -s | --sanity
+        Check that dependencies are available and hosts reachable.
+        This check takes place before moving forward with any action.
+
+Actions: 
+
+    -h | --help
+        Display this test.
+    --list networks
+        Display networks known to this ZeroTier moon.
+    --list network clients <network name>
+        Display clients registered with this ZeroTier moon.
+    --list network tags <network name>
+        Display tags for a given network.
+    --list client tags <network name> <client name>
+        Display tags for a given client in the specified network.
+    --set network tag <network name> <tag number> [default number]
+        Set (i.e. add or replace) tag in a network's settings.
+        Or default number is omitted, it will be considered to be null.
+    --unset network tag <network name> <tag number>
+        Remove tag from a network's settings.
+    --set client tag <network name> <client name> <tag number> <enum number>
+        Set (i.e. add or replace) tag and value in a client's settings.
+    --unset client tag <network name> <client name> <tag number>
+        Remove tag from a client's settings.
+    --list client capabilities <network name> <client name>
+        Not implemented yet.
+    --set client capability <network name> <client name> <...>
+        Not implemented yet.
+    --unset client capability <network name> <client name> <...>
+        Not implemented yet.
+    --list network rules <network name>
+        Display network rules in compiled form.
+    --set network rules <network name> [rule file name]
+        Set rules for this network.
+        If no file name is provided, stdin will be used.
+
+EOB
+}
+
+param() {
+  echo  "Invalid parameter: $1" 1>&2
+}
+
+sanity() {
+  [[ -z "$SANITY" ]] && { return; }
+  which jq &>/dev/null || {
+    echo "Sanity check: please install 'jq' before using this tool." 1>&2
+    exit 1
+  }
+  p=$(ssh $ZT_HOST "sudo sh -c 'ls -d $ZT_PATH/controller.d/network'" 2>/dev/null) || {
+    echo "Sanity check: unable to SSH to $ZT_HOST" 1>&2
+    exit 1
+  }
+  [[ "$p" == "$ZT_PATH/controller.d/network" ]] || {
+    echo "Sanity check: path '$ZT_PATH' seems wrong." 1>&2
+    exit 1
+  }
+}
+
+list_networks() {
+  sanity
+  [[ -z "$DETAILS" ]] && {
+    for f in $(ssh $ZT_HOST "sudo sh -c 'ls $ZT_PATH/controller.d/network/*.json'"); do bn="${f##*/}"; echo "- ${bn%.*}"; done
+  } || {
+    for f in $(ssh $ZT_HOST "sudo sh -c 'ls $ZT_PATH/controller.d/network/*.json'"); do
+      ssh $ZT_HOST "sudo sh -c 'cat $f'" | jq -j '"id: ",.id," name: ",.name'
+      echo
+    done
+  }
+}
+
+list_network_clients() {
+  sanity
+  [[ -z "$DETAILS" ]] && {
+    for f in $(ssh $ZT_HOST sudo ls $ZT_PATH/controller.d/network/$NETWORK_NAME/member/ | grep 'json$'); do echo "- ${f%.*}"; done
+  } || {
+    for f in $(ssh $ZT_HOST "sudo sh -c 'ls $ZT_PATH/controller.d/network/$NETWORK_NAME/member/*.json'"); do
+      ssh $ZT_HOST "sudo sh -c 'cat $f'" | jq -j '"id: ",.id," authorized: ",.authorized," ip: ",.ipAssignments[]'
+      echo
+    done
+  }
+}
+
+list_network_tags() {
+  sanity
+  ssh $ZT_HOST "sudo sh -c 'cat $ZT_PATH/controller.d/network/$NETWORK_NAME.json'" \
+    | jq -r '.tags[] | "Tag: \(.id) Default: \(.default)"'
+  echo
+}
+
+list_client_tags() {
+  sanity
+  ssh $ZT_HOST "sudo sh -c 'cat $ZT_PATH/controller.d/network/$NETWORK_NAME/member/$CLIENT_NAME.json'" \
+    | jq -r '.tags[] | "Tag: \(.[0]) Value: \(.[1])"'
+  echo
+}
+
+check_tag_exists() {
+  for tagid in $(ssh $ZT_HOST "sudo sh -c 'cat $ZT_PATH/controller.d/network/$NETWORK_NAME.json'" \
+    | jq -r '.tags[] | .id'); do
+    [[ "$tagid" == "$TAG_NUMBER" ]] && { return; }
+  done
+  echo "Tag '$TAG_NUMBER' does not exist in network '$NETWORK_NAME'" 1>&2
+  exit 1
+}
+
+set_network_tag() {
+  sanity
+  [[ -z "$TAG_NUMBER" ]] && {
+    echo "Missing argument. Need <tag number>" 1>&2
+    exit 0
+  }
+  [[ -z "$ENUMORDEFAULT_NUMBER" ]] && {
+    ENUMORDEFAULT_NUMBER=null
+  }
+  IFS='' read -r -d '' appendstr <<EOB
+  [
+    {
+      "default": $ENUMORDEFAULT_NUMBER,
+      "id": $TAG_NUMBER
+    }
+  ]
+EOB
+  newstr=$(ssh $ZT_HOST "sudo sh -c 'cat $ZT_PATH/controller.d/network/$NETWORK_NAME.json'" \
+    | jq --argjson tag_number $TAG_NUMBER --argjson appendstr "$(echo $appendstr | jq .)" '.tags | map(select(.id != $tag_number)) | . += $appendstr')
+  newconfig=$(ssh $ZT_HOST "sudo sh -c 'cat $ZT_PATH/controller.d/network/$NETWORK_NAME.json'" \
+    | jq --argjson newstr "$(echo $newstr | jq .)" '.tags = $newstr')
+  ssh $ZT_HOST "sudo cp $ZT_PATH/controller.d/network/$NETWORK_NAME.json \
+    $ZT_PATH/controller.d/network/$NETWORK_NAME.json.bak"
+  echo $newconfig | ssh $ZT_HOST "sudo sh -c 'cat > $ZT_PATH/controller.d/network/$NETWORK_NAME.json'"
+  [[ $? -eq 0 ]] && { echo "Tag set."; }
+  echo
+}
+
+set_network_rules() {
+  sanity
+  newstr=$(<"${SOURCE_FILE:-/dev/stdin}")
+  newconfig=$(ssh $ZT_HOST "sudo sh -c 'cat $ZT_PATH/controller.d/network/$NETWORK_NAME.json'" \
+    | jq --argjson newstr "$(echo $newstr | jq .)" '.rules = $newstr')
+  ssh $ZT_HOST "sudo cp $ZT_PATH/controller.d/network/$NETWORK_NAME.json \
+    $ZT_PATH/controller.d/network/$NETWORK_NAME.json.bak"
+  echo $newconfig | ssh $ZT_HOST "sudo sh -c 'cat > $ZT_PATH/controller.d/network/$NETWORK_NAME.json'"
+  [[ $? -eq 0 ]] && { echo "Rules set."; }
+  echo
+}
+
+set_client_tag() {
+  sanity
+  [[ -z "$TAG_NUMBER" || -z "$ENUMORDEFAULT_NUMBER" ]] && {
+    echo "Missing arguments. Need <tag number> and <enum number>" 1>&2
+    exit 0
+  }
+  check_tag_exists
+  IFS='' read -r -d '' appendstr <<EOB
+  [
+    [
+      $TAG_NUMBER,
+      $ENUMORDEFAULT_NUMBER
+    ]
+  ]
+EOB
+  newstr=$(ssh $ZT_HOST "sudo sh -c 'cat $ZT_PATH/controller.d/network/$NETWORK_NAME/member/$CLIENT_NAME.json'" \
+    | jq --argjson tag_number $TAG_NUMBER --argjson appendstr "$(echo $appendstr | jq .)" '.tags | map(select(.[0] != $tag_number)) | . += $appendstr')
+  newconfig=$(ssh $ZT_HOST "sudo sh -c 'cat $ZT_PATH/controller.d/network/$NETWORK_NAME/member/$CLIENT_NAME.json'" \
+    | jq --argjson newstr "$(echo $newstr | jq .)" '.tags = $newstr')
+  ssh $ZT_HOST "sudo cp $ZT_PATH/controller.d/network/$NETWORK_NAME/member/$CLIENT_NAME.json \
+    $ZT_PATH/controller.d/network/$NETWORK_NAME/member/$CLIENT_NAME.json.bak"
+  echo $newconfig | ssh $ZT_HOST "sudo sh -c 'cat > $ZT_PATH/controller.d/network/$NETWORK_NAME/member/$CLIENT_NAME.json'"
+  [[ $? -eq 0 ]] && { echo "Tag set."; }
+  echo
+}
+
+unset_network_tag() {
+  sanity
+  [[ -z "$TAG_NUMBER" ]] && {
+    echo "Missing argument. Need <tag number>" 1>&2
+    exit 0
+  }
+  newstr=$(ssh $ZT_HOST "sudo sh -c 'cat $ZT_PATH/controller.d/network/$NETWORK_NAME.json'" \
+    | jq --argjson tag_number $TAG_NUMBER '.tags | map(select(.id != $tag_number))')
+  newconfig=$(ssh $ZT_HOST "sudo sh -c 'cat $ZT_PATH/controller.d/network/$NETWORK_NAME.json'" \
+    | jq --argjson newstr "$(echo $newstr | jq .)" '.tags = $newstr')
+  ssh $ZT_HOST "sudo cp $ZT_PATH/controller.d/network/$NETWORK_NAME.json \
+    $ZT_PATH/controller.d/network/$NETWORK_NAME.json.bak"
+  echo $newconfig | ssh $ZT_HOST "sudo sh -c 'cat > $ZT_PATH/controller.d/network/$NETWORK_NAME.json'"
+  [[ $? -eq 0 ]] && { echo "Tag unset."; }
+  echo
+}
+
+unset_client_tag() {
+  sanity
+  [[ -z "$TAG_NUMBER" ]] && {
+    echo "Missing argument. Need <tag number>" 1>&2
+    exit 0
+  }
+  newstr=$(ssh $ZT_HOST "sudo sh -c 'cat $ZT_PATH/controller.d/network/$NETWORK_NAME/member/$CLIENT_NAME.json'" \
+    | jq --argjson tag_number $TAG_NUMBER '.tags | map(select(.[0] != $tag_number))')
+  newconfig=$(ssh $ZT_HOST "sudo sh -c 'cat $ZT_PATH/controller.d/network/$NETWORK_NAME/member/$CLIENT_NAME.json'" \
+    | jq --argjson newstr "$(echo $newstr | jq .)" '.tags = $newstr')
+  ssh $ZT_HOST "sudo cp $ZT_PATH/controller.d/network/$NETWORK_NAME/member/$CLIENT_NAME.json \
+    $ZT_PATH/controller.d/network/$NETWORK_NAME/member/$CLIENT_NAME.json.bak"
+  echo $newconfig | ssh $ZT_HOST "sudo sh -c 'cat > $ZT_PATH/controller.d/network/$NETWORK_NAME/member/$CLIENT_NAME.json'"
+  [[ $? -eq 0 ]] && { echo "Tag unset."; }
+  echo
+}
+
+list_network_rules() {
+  sanity
+  ssh $ZT_HOST "sudo sh -c 'cat $ZT_PATH/controller.d/network/$NETWORK_NAME.json'" \
+    | jq -r '.rules[]'
+  echo
+}
+
+
+[[ "$1" == "" ]] && { usage; exit 0; }
+
+ACTION=""
+NETWORK_NAME=""
+CLIENT_NAME=""
+TAG_NUMBER=""
+ENUMORDEFAULT_NUMBER=""
+CONFIG="zt.cfg"
+
+while [[ -n "$1" ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+    ;;
+    -c|--config)
+      shift
+      CONFIG="$1"
+      shift
+      ;;
+    -d|--details)
+      shift
+      DETAILS="on"
+      ;;
+    -l|--list)
+      shift
+      case "$1" in
+        networks)
+          shift
+          ACTION="list-networks"
+        ;;
+        network)
+          shift
+          case "$1" in
+            clients)
+              shift
+              NETWORK_NAME="$1"
+              shift
+              ACTION="list-network-clients"
+            ;;
+            tags)
+              shift
+              NETWORK_NAME="$1"
+              shift
+              ACTION="list-network-tags"
+            ;;
+            rules)
+              shift
+              NETWORK_NAME="$1"
+              shift
+              ACTION="list-network-rules"
+            ;;
+          esac
+          ;;
+        client)
+          shift
+          case "$1" in
+            tags)
+              shift
+              NETWORK_NAME="$1"
+              shift
+              CLIENT_NAME="$1"
+              shift
+              ACTION="list-client-tags"
+            ;;
+            *)
+              param $1
+              exit 1
+            ;;
+          esac
+          ;;
+        esac
+        ;;
+    --set)
+      shift
+      case "$1" in
+        network)
+          shift
+          case "$1" in
+            tag)
+              shift
+              NETWORK_NAME="$1"
+              shift
+              TAG_NUMBER="$1"
+              shift
+              ENUMORDEFAULT_NUMBER="$1"
+              shift
+              ACTION="set-network-tag"
+            ;;
+            rules)
+              shift
+              NETWORK_NAME="$1"
+              shift
+              SOURCE_FILE="$1"
+              shift
+              ACTION="set-network-rules"
+            ;;
+            *)
+              param $1
+              exit 1
+            ;;
+          esac
+          ;;
+        client)
+          shift
+          case "$1" in
+            tag)
+              shift
+              NETWORK_NAME="$1"
+              shift
+              CLIENT_NAME="$1"
+              shift
+              TAG_NUMBER="$1"
+              shift
+              ENUMORDEFAULT_NUMBER="$1"
+              shift
+              ACTION="set-client-tag"
+            ;;
+            *)
+              param $1
+              exit 1
+            ;;
+          esac
+          ;;
+        esac
+        ;;
+    --unset)
+      shift
+      case "$1" in
+        network)
+          shift
+          case "$1" in
+            tag)
+              shift
+              NETWORK_NAME="$1"
+              shift
+              TAG_NUMBER="$1"
+              shift
+              ACTION="unset-network-tag"
+            ;;
+            *)
+              param $1
+              exit 1
+            ;;
+          esac
+          ;;
+        client)
+          shift
+          case "$1" in
+            tag)
+              shift
+              NETWORK_NAME="$1"
+              shift
+              CLIENT_NAME="$1"
+              shift
+              TAG_NUMBER="$1"
+              shift
+              ACTION="unset-client-tag"
+            ;;
+            *)
+              param $1
+              exit 1
+            ;;
+          esac
+          ;;
+        esac
+        ;;
+    -s|--sanity)
+      shift
+      SANITY="on"
+      ;;
+    *)
+      param $1
+      exit 1
+    ;;
+  esac
+done
+
+source $CONFIG &>/dev/null || { echo "Unable to read config file: $CONFIG" 1>&2; exit 1; }
+
+for c in ZT_HOST ZT_PATH; do
+  [[ -z "${!c+x}" ]] && { echo "Missing configuration for $c" 1>&2; exit 1; }
+done
+
+
+case $ACTION in
+  "list-networks")
+    list_networks
+    ;;
+  "list-network-clients")
+    list_network_clients
+    ;;
+  "list-network-tags")
+    list_network_tags
+    ;;
+  "list-network-rules")
+    list_network_rules
+    ;;
+  "list-client-tags")
+    list_client_tags
+    ;;
+  "set-network-tag")
+    set_network_tag
+    ;;
+  "set-network-rules")
+    set_network_rules
+    ;;
+  "set-client-tag")
+    set_client_tag
+    ;;
+  "unset-network-tag")
+    unset_network_tag
+    ;;
+  "unset-client-tag")
+    unset_client_tag
+    ;;
+  *)
+    usage
+    exit 0
+    ;;
+  esac
